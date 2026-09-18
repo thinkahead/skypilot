@@ -102,7 +102,13 @@ def get_s3_mount_install_cmd() -> str:
         # Extract core rclone installation logic without redundant ARCH check
         f'  {get_rclone_install_cmd()}; '
         'else '
-        '  sudo wget -nc https://github.com/aylei/goofys/'
+        # No `-nc`: `wget -nc -O <file>` is broken — `-O` truncates the output
+        # file, then `-nc` sees it "already exists" and skips downloading, so
+        # goofys is left 0-byte (or partial from an interrupted retry) and can't
+        # execute -> mount fails with 126/1. Plain `wget -O` re-downloads the
+        # full binary every time (idempotent / retry-safe). Verified on-cluster:
+        # with `-nc` -> 0 bytes; without -> full ~34 MB binary.
+        '  sudo wget https://github.com/aylei/goofys/'
         'releases/download/0.24.0-ec7d1b84/goofys-linux-amd64 '
         '-O /usr/local/bin/goofys && '
         'sudo chmod 755 /usr/local/bin/goofys; '

@@ -192,6 +192,34 @@ _JOB_ID_PATTERN = re.compile(r'Job ID: ([0-9]+)')
 _JOB_IDS_PATTERN = re.compile(r'Job IDs: ([0-9,]+)')
 _LOG_DIR_PATTERN = re.compile(r'Log Dir: ([^ ]+)')
 
+# Docker-image clusters route every command over an SSH ProxyCommand with
+# ControlMaster disabled; that transport intermittently returns exit code 255
+# even when the remote command actually succeeded (most reproducibly on fresh
+# GPU launches). The operations guarded below are idempotent (file-mount
+# sync/symlink/mount) or safe to re-run (add_job), so we retry them on a 255.
+# See docs/skypilot_kd.md ("fresh-GPU-launch spurious 255").
+_SPURIOUS_SSH_255_RETRIES = 3
+_SPURIOUS_SSH_255_BACKOFF_SECONDS = 5
+
+
+def _run_retrying_spurious_ssh_255(func, description: str):
+    """Runs func(), retrying on a spurious docker-proxy SSH exit-255 error.
+
+    Retries only when the raised CommandError has returncode 255 (the spurious
+    ControlMaster-over-proxy drop); any other failure is raised immediately.
+    """
+    for attempt in range(_SPURIOUS_SSH_255_RETRIES + 1):
+        try:
+            return func()
+        except exceptions.CommandError as e:
+            if (e.returncode != 255 or attempt == _SPURIOUS_SSH_255_RETRIES):
+                raise
+            logger.warning(
+                f'{description} returned 255 (likely a spurious docker-proxy '
+                f'SSH drop); retrying '
+                f'{attempt + 1}/{_SPURIOUS_SSH_255_RETRIES}...')
+            time.sleep(_SPURIOUS_SSH_255_BACKOFF_SECONDS)
+
 # Path to the monkey-patched ray up script.
 # We don't do import then __file__ because that script needs to be filled in
 # (so import would fail).
@@ -4223,12 +4251,23 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             # For Slurm, run in background so that SSH returns immediately.
             # This is needed because we add the wait_for_job code above which
             # makes the command block until the job completes.
-            returncode, stdout, stderr = self.run_on_head(
-                handle,
-                job_submit_cmd,
-                stream_logs=False,
-                require_outputs=True,
-                run_in_background=is_slurm)
+            # Retry on a spurious docker-proxy SSH 255 (same rationale as
+            # _add_job above; queue_job by job_id is safe to re-issue).
+            for _attempt in range(_SPURIOUS_SSH_255_RETRIES + 1):
+                returncode, stdout, stderr = self.run_on_head(
+                    handle,
+                    job_submit_cmd,
+                    stream_logs=False,
+                    require_outputs=True,
+                    run_in_background=is_slurm)
+                if (returncode != 255 or
+                        _attempt == _SPURIOUS_SSH_255_RETRIES):
+                    break
+                logger.warning(
+                    f'Submitting job {job_id} returned 255 (likely a spurious '
+                    f'docker-proxy SSH drop); retrying '
+                    f'{_attempt + 1}/{_SPURIOUS_SSH_255_RETRIES}...')
+                time.sleep(_SPURIOUS_SSH_255_BACKOFF_SECONDS)
             # Happens when someone calls `sky exec` but remote is outdated for
             # running a job. Necessitating calling `sky launch`.
             backend_utils.check_stale_runtime_on_remote(returncode, stderr,
@@ -4296,18 +4335,30 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 run_timestamp=self.run_timestamp,
                 resources_str=resources_str,
                 metadata=metadata)
-            returncode, result_str, stderr = self.run_on_head(
-                handle,
-                code,
-                stream_logs=False,
-                require_outputs=True,
-                separate_stderr=True)
+            # Retry on exit code 255: the docker-proxy SSH (ControlMaster
+            # disabled) intermittently returns 255 even when the remote command
+            # succeeded — most reproducibly on fresh GPU launches. Implements the
+            # long-standing TODO below. Re-running add_job is safe: a stray
+            # earlier registration only leaves an orphaned, never-launched job id.
+            for _attempt in range(_SPURIOUS_SSH_255_RETRIES + 1):
+                returncode, result_str, stderr = self.run_on_head(
+                    handle,
+                    code,
+                    stream_logs=False,
+                    require_outputs=True,
+                    separate_stderr=True)
+                if (returncode != 255 or
+                        _attempt == _SPURIOUS_SSH_255_RETRIES):
+                    break
+                logger.warning(
+                    f'Fetching job id returned 255 (likely a spurious '
+                    f'docker-proxy SSH drop); retrying '
+                    f'{_attempt + 1}/{_SPURIOUS_SSH_255_RETRIES}...')
+                time.sleep(_SPURIOUS_SSH_255_BACKOFF_SECONDS)
             # Happens when someone calls `sky exec` but remote is outdated for
             # adding a job. Necessitating calling `sky launch`.
             backend_utils.check_stale_runtime_on_remote(returncode, stderr,
                                                         handle.cluster_name)
-            # TODO(zhwu): this sometimes will unexpectedly fail, we can add
-            # retry for this, after we figure out the reason.
             subprocess_utils.handle_returncode(returncode, code,
                                                'Failed to fetch job id.',
                                                stderr)
@@ -6331,20 +6382,24 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             ]
             command = ' && '.join(download_target_commands)
             # dst is only used for message printing.
-            backend_utils.parallel_data_transfer_to_nodes(
-                runners,
-                source=src,
-                target=dst,
-                cmd=command,
-                run_rsync=False,
-                action_message='Syncing',
-                log_path=log_path,
-                stream_logs=False,
-                # Need to source bashrc, as the cloud specific CLI or SDK may
-                # require PATH in bashrc.
-                source_bashrc=True,
-                num_threads=num_threads,
-            )
+            # Retry on a spurious docker-proxy SSH 255 (the S3 COPY/sync is
+            # idempotent).
+            _run_retrying_spurious_ssh_255(
+                lambda: backend_utils.parallel_data_transfer_to_nodes(
+                    runners,
+                    source=src,
+                    target=dst,
+                    cmd=command,
+                    run_rsync=False,
+                    action_message='Syncing',
+                    log_path=log_path,
+                    stream_logs=False,
+                    # Need to source bashrc, as the cloud specific CLI or SDK
+                    # may require PATH in bashrc.
+                    source_bashrc=True,
+                    num_threads=num_threads,
+                ),
+                'file_mounts sync')
         # (2) Run the commands to create symlinks on all the nodes.
         symlink_command = ' && '.join(symlink_commands)
         if symlink_command:
@@ -6356,7 +6411,18 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 f'{symlink_command}')
 
             def _symlink_node(runner: command_runner.CommandRunner):
-                returncode = runner.run(symlink_command, log_path=log_path)
+                # Retry on a spurious docker-proxy SSH 255 (the symlink command
+                # is idempotent — it removes any existing link first).
+                for _attempt in range(_SPURIOUS_SSH_255_RETRIES + 1):
+                    returncode = runner.run(symlink_command, log_path=log_path)
+                    if (returncode != 255 or
+                            _attempt == _SPURIOUS_SSH_255_RETRIES):
+                        break
+                    logger.warning(
+                        f'Creating symlinks returned 255 (likely a spurious '
+                        f'docker-proxy SSH drop); retrying '
+                        f'{_attempt + 1}/{_SPURIOUS_SSH_255_RETRIES}...')
+                    time.sleep(_SPURIOUS_SSH_255_BACKOFF_SECONDS)
                 subprocess_utils.handle_returncode(
                     returncode, symlink_command,
                     'Failed to create symlinks. The target destination '
@@ -6442,19 +6508,26 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             if isinstance(src_print, list):
                 src_print = ', '.join(src_print)
             try:
-                backend_utils.parallel_data_transfer_to_nodes(
-                    runners,
-                    source=src_print,
-                    target=dst,
-                    cmd=mount_cmd,
-                    run_rsync=False,
-                    action_message=action_message,
-                    log_path=log_path,
-                    # Need to source bashrc, as the cloud specific CLI or SDK
-                    # may require PATH in bashrc.
-                    source_bashrc=True,
-                    num_threads=num_threads,
-                )
+                # Retry on a spurious docker-proxy SSH 255 (the mount is
+                # idempotent — the mount script unmounts first if the path is
+                # already mounted). Non-255 CommandErrors (e.g.
+                # MOUNT_PATH_NON_EMPTY_CODE) are re-raised immediately and handled
+                # below.
+                _run_retrying_spurious_ssh_255(
+                    lambda: backend_utils.parallel_data_transfer_to_nodes(
+                        runners,
+                        source=src_print,
+                        target=dst,
+                        cmd=mount_cmd,
+                        run_rsync=False,
+                        action_message=action_message,
+                        log_path=log_path,
+                        # Need to source bashrc, as the cloud specific CLI or
+                        # SDK may require PATH in bashrc.
+                        source_bashrc=True,
+                        num_threads=num_threads,
+                    ),
+                    'storage mount')
             except exceptions.CommandError as e:
                 if e.returncode == exceptions.MOUNT_PATH_NON_EMPTY_CODE:
                     mount_path = (f'{colorama.Fore.RED}'
