@@ -258,9 +258,22 @@ def _sbatch_provision_script_path(base_dir: str,
 
 def _skypilot_runtime_dir(tmpdir: Optional[str],
                           cluster_name_on_cloud: str) -> str:
-    """Returns the SkyPilot runtime directory path on the Slurm cluster."""
-    tmp = tmpdir if tmpdir is not None else '/tmp'
-    return os.path.join(tmp, cluster_name_on_cloud)
+    """Returns the SkyPilot runtime directory path on the Slurm cluster.
+
+    SHARED-RUNTIME MODE: we intentionally return ``tmpdir`` itself (NOT a
+    per-cluster subdir), so the expensive skypilot-runtime venv (uv + sky + ray)
+    is built ONCE under ``tmpdir/skypilot-runtime`` and REUSED across launches --
+    setup_runtime is idempotent and wheel-hash-guarded, so on later launches it
+    becomes a fast no-op. The cleanup trap is patched to NOT delete this dir.
+    Point ``tmpdir`` at a shared, container-visible FS (e.g. /proj/.../sky-runtime).
+
+    NOTE: the runtime dir also holds per-cluster skylet state (skylet_pid,
+    jobs.db), so this is safe for ONE cluster at a time (sequential launches);
+    concurrent clusters sharing the same ``tmpdir`` would collide.
+    ``cluster_name_on_cloud`` is unused in this mode.
+    """
+    del cluster_name_on_cloud  # unused in shared-runtime mode
+    return tmpdir if tmpdir is not None else '/tmp'
 
 
 def _enroot_container_name_global_scope(cluster_name_on_cloud: str) -> str:
@@ -557,6 +570,13 @@ def _create_virtual_instance(
         # it so the container can access sky_cluster_home_dir.
         if workdir is not None and workdir != remote_home_dir:
             mount_paths.append(f'{workdir}:{workdir}')
+        # Bind-mount the InfiniBand device tree so NCCL can use the IB fabric for
+        # multi-node collectives (BlueVela H100 + IB). Harmless (unused) on single
+        # node. NOTE: BlueVela-specific -- this must exist on the COMPUTE node (it
+        # always does on BlueVela); it can't be host-tested here since this code
+        # runs on the API server, not the node. On a non-IB Slurm cluster this
+        # mount source would be absent and should be dropped (or gated via config).
+        mount_paths.append('/dev/infiniband:/dev/infiniband')
         container_mounts = ','.join(mount_paths)
         # Add sudo alias to bashrc since we're already root in the container.
         # This allows scripts with 'sudo' commands to work without modification.
@@ -568,7 +588,8 @@ echo "[container-init] Starting..."
 INIT_START=$SECONDS
 apt-get update
 apt-get install -y ca-certificates rsync curl git wget fuse
-echo 'alias sudo=""' >> ~/.bashrc
+mkdir -p "$HOME" 2>/dev/null || true
+echo 'alias sudo=""' >> "$HOME/.bashrc" 2>/dev/null || true
 echo "[container-init] Packages installed in $((SECONDS - INIT_START))s"
 """
         container_marker_file = (f'{sky_cluster_home_dir}/'
@@ -587,11 +608,33 @@ echo "[container-init] Packages installed in $((SECONDS - INIT_START))s"
             f'echo "[container] Initializing {container_name} on all nodes"\n'
             f'rm -rf {container_init_done_dir}\n'
             f'mkdir -p {container_init_done_dir}\n'
+            # Ensure enroot's NVIDIA hook injects the GPU driver (libcuda.so.1)
+            # into the container at creation; without these the container has no
+            # driver and torch/CUDA fail with
+            # "libcuda.so.1: cannot open shared object file". pyxis passes them
+            # through from the host env via --container-env below.
+            'export NVIDIA_VISIBLE_DEVICES=all\n'
+            'export NVIDIA_DRIVER_CAPABILITIES=compute,utility\n'
+            # IDEMPOTENT CREATE: wipe any stale per-node enroot container of this
+            # name before (re)creating it. cluster_name_on_cloud is a deterministic
+            # hash, so a container left behind by a prior allocation that was killed
+            # WITHOUT running the teardown trap below (a manual scancel, or a
+            # failed-setup launch whose job id was never recorded so `sky down`
+            # can't clean it) makes the ':create' below reuse a broken, not-running
+            # container -> the later ':exec' step fails with
+            # "exec flag was passed to --container-name but the container is not
+            # running". Remove-then-create guarantees a clean slate; harmless (|| true)
+            # when nothing is there. Same command/name as the teardown trap.
+            f'srun --nodes={num_nodes} --ntasks-per-node=1 '
+            f'enroot remove -f '
+            f'{shlex.quote(_enroot_container_name_global_scope(cluster_name_on_cloud))} '
+            f'2>/dev/null || true\n'
             f'srun --overlap {"--label " if num_nodes > 1 else ""}--unbuffered '
             f'--nodes={num_nodes} --ntasks-per-node=1 '
             f'--container-image={shlex.quote(container_image)} '
             f'--container-name={shlex.quote(container_name)}:create '
             f'--container-mounts="{container_mounts}" '
+            '--container-env=NVIDIA_VISIBLE_DEVICES,NVIDIA_DRIVER_CAPABILITIES '
             f'--container-remap-root '
             f'--no-container-mount-home '
             f'--container-writable '
@@ -655,12 +698,11 @@ cleanup() {{
     # When container_scope=job, named containers are removed automatically
     # at the end of the Slurm job, see: https://github.com/NVIDIA/pyxis/wiki/Setup#slurm-epilog
     srun --nodes={num_nodes} --ntasks-per-node=1 enroot remove -f {shlex.quote(_enroot_container_name_global_scope(cluster_name_on_cloud))} 2>/dev/null || true
-    # Clean up sky runtime directory on each node.
-    # NOTE: We can do this because --nodes for both this srun and the
-    # sbatch is the same number. Otherwise, there are no guarantees
-    # that this srun will run on the same subset of nodes as the srun
-    # that created the sky directories.
-    srun --nodes={num_nodes} rm -rf {skypilot_runtime_dir}
+    # SHARED-RUNTIME MODE: do NOT delete the runtime dir ({skypilot_runtime_dir})
+    # on teardown -- it is the shared, reused skypilot-runtime venv (see
+    # _skypilot_runtime_dir). Deleting it would force a slow rebuild on the next
+    # launch. Only the per-cluster home dir is removed. (Sweep the shared runtime
+    # manually if it ever needs reclaiming.)
     rm -rf {sky_cluster_home_dir}
     exit $saved_exit
 }}

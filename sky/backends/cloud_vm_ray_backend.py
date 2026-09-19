@@ -6686,9 +6686,23 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 container_name = slurm_utils.pyxis_container_name(
                     handle.cluster_name_on_cloud)
 
+            # Resolve SKY_RUNTIME_DIR (tmpdir/<cluster>) the same way the
+            # provisioner does, so container executor runs can export it (pyxis
+            # does not inherit it from the host).
+            slurm_tmpdir = skypilot_config.get_effective_region_config(
+                cloud='slurm',
+                region=((handle.cached_cluster_info.provider_config or {}).get(
+                    'cluster') or handle.launched_resources.region),
+                keys=('tmpdir',),
+                default_value=None)
+            # Shared-runtime mode: the runtime dir is `tmpdir` itself (see
+            # sky/provision/slurm/instance.py:_skypilot_runtime_dir), not a
+            # per-cluster subdir. Keep this in sync with that function.
+            skypilot_runtime_dir = slurm_tmpdir or '/tmp'
             return task_codegen.SlurmCodeGen(
                 slurm_job_id,
                 container_name,
+                skypilot_runtime_dir=skypilot_runtime_dir,
             )
         else:
             return task_codegen.RayCodeGen()

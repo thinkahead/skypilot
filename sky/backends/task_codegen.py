@@ -691,16 +691,23 @@ class SlurmCodeGen(TaskCodeGen):
         self,
         slurm_job_id: str,
         container_name: Optional[str],
+        skypilot_runtime_dir: Optional[str] = None,
     ):
         """Initialize SlurmCodeGen.
 
         Args:
             slurm_job_id: The Slurm job ID, i.e. SLURM_JOB_ID
             container_name: pyxis container name, or None
+            skypilot_runtime_dir: SKY_RUNTIME_DIR on the cluster (where
+                setup_runtime installed the runtime venv + python_path).
+                For container runs this is exported into the container so the
+                executor can locate the runtime python (pyxis/enroot does not
+                inherit it from the host).
         """
         super().__init__()
         self._slurm_job_id = slurm_job_id
         self._container_name = container_name
+        self._skypilot_runtime_dir = skypilot_runtime_dir
 
     def add_prologue(self, job_id: int) -> None:
         assert not self._has_prologue, 'add_prologue() called twice?'
@@ -931,11 +938,25 @@ class SlurmCodeGen(TaskCodeGen):
                     #   fetch_config: DNS SRV lookup failed
                     #   fatal: Could not establish a configuration source
                     cmd_parts = []
-                    # Only unset SKY_RUNTIME_DIR for container runs. For non-container
-                    # runs, we want to inherit the node-local SKY_RUNTIME_DIR set by
-                    # SlurmCommandRunner to avoid SQLite WAL issues on shared filesystems.
-                    if {True if container_flags else False}:
-                        cmd_parts.append('unset SKY_RUNTIME_DIR;')
+                    # NOTE: this block is inside an f-string template -- keep it free of
+                    # curly braces (they are parsed as f-string fields).
+                    # For container runs, pyxis/enroot does NOT inherit the driver's
+                    # SKY_RUNTIME_DIR (srun --export=ALL does not cross into the
+                    # container). Without it the executor resolves the runtime python at
+                    # the container HOME -- where setup_runtime did NOT install the
+                    # runtime -- and falls back to `which python3`, which exits 127 on
+                    # images whose which/python3 are not set up. So explicitly export the
+                    # driver's SKY_RUNTIME_DIR (the shared, container-visible dir where
+                    # setup_runtime installed the skypilot-runtime venv + python_path;
+                    # requires the slurm tmpdir to be on a shared FS, see
+                    # ~/.sky/config.yaml).
+                    _rt = {self._skypilot_runtime_dir!r}
+                    if {True if container_flags else False} and _rt:
+                        cmd_parts.append(
+                            'echo [sky-rtdbg] SKY_RUNTIME_DIR=' +
+                            shlex.quote(_rt) + ' 1>&2;')
+                        cmd_parts.append(
+                            'export SKY_RUNTIME_DIR=' + shlex.quote(_rt) + ';')
                     cmd_parts.extend([
                         constants.SKY_SLURM_PYTHON_CMD,
                         '-m sky.skylet.executor.slurm',

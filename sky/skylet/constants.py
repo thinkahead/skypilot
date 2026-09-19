@@ -78,7 +78,7 @@ SKY_PYTHON_PATH_FILE = f'{SKY_RUNTIME_DIR}/.sky/python_path'
 SKY_RAY_PATH_FILE = f'{SKY_RUNTIME_DIR}/.sky/ray_path'
 SKY_GET_PYTHON_PATH_CMD = (f'[ -s {SKY_PYTHON_PATH_FILE} ] && '
                            f'cat {SKY_PYTHON_PATH_FILE} 2> /dev/null || '
-                           'which python3')
+                           'command -v python3')
 # Python executable, e.g., /opt/conda/bin/python3
 SKY_PYTHON_CMD = (f'{SKY_UNSET_PYTHONPATH_AND_SET_CWD} '
                   f'$({SKY_GET_PYTHON_PATH_CMD})')
@@ -90,14 +90,17 @@ SKY_PIP_CMD = f'{SKY_PYTHON_CMD} -m pip'
 # The ray executable is a python script with a header like:
 #   #!/opt/conda/bin/python3
 SKY_RAY_CMD = (f'{SKY_PYTHON_CMD} $([ -s {SKY_RAY_PATH_FILE} ] && '
-               f'cat {SKY_RAY_PATH_FILE} 2> /dev/null || which ray)')
+               f'cat {SKY_RAY_PATH_FILE} 2> /dev/null || command -v ray)')
 
-# Use $(which env) to find env, falling back to /usr/bin/env if which is
-# unavailable. This works around a Slurm quirk where srun's execvp() doesn't
-# check execute permissions, failing when $HOME/.local/bin/env (non-executable,
-# from uv installation) shadows /usr/bin/env.
-SKY_SLURM_UNSET_PYTHONPATH = ('$(which env 2>/dev/null || echo /usr/bin/env) '
-                              '-u PYTHONPATH')
+# Use `command -v env` (a POSIX shell builtin) to find env, falling back to
+# /usr/bin/env. NOTE: do NOT use `which` here -- some container images ship a
+# nonstandard `which` that prints a "Usage:" banner to stdout AND returns 0 for
+# a normal argument, which poisons this command substitution and makes the shell
+# try to run "Usage:" ("Usage:: command not found", exit 127). `command -v`
+# avoids that, and (like `which`) skips a non-executable $HOME/.local/bin/env
+# shadow from a uv install that would otherwise trip srun's execvp().
+SKY_SLURM_UNSET_PYTHONPATH = (
+    '$(command -v env 2>/dev/null || echo /usr/bin/env) -u PYTHONPATH')
 SKY_SLURM_PYTHON_CMD = (f'{SKY_SLURM_UNSET_PYTHONPATH} '
                         f'$({SKY_GET_PYTHON_PATH_CMD})')
 
@@ -283,6 +286,27 @@ CONDA_INSTALLATION_COMMANDS = (
     'fi;')
 
 UV_INSTALLATION_COMMANDS = (
+    # Serialize concurrent runtime builds that share one SKY_RUNTIME_DIR (Slurm
+    # shared-runtime on GPFS) with an atomic mkdir "folder lock" -- the same
+    # pattern the enroot-image ansible build uses. flock/lockf are unreliable /
+    # config-dependent on GPFS, but mkdir is atomic on POSIX/GPFS: the first
+    # builder creates the venv under the lock; others block, then find the venv
+    # present and skip. A stale lock (>30m => a dead build) is stolen. The lock
+    # is released by a trap when this setup shell exits (covering the venv build
+    # AND the wheel install that follows in the same setup command). For
+    # per-cluster (non-shared) runtime dirs the lock is simply uncontended.
+    f'mkdir -p {SKY_RUNTIME_DIR} 2>/dev/null || true;'
+    f'_sky_lk={SKY_RUNTIME_DIR}/.sky_runtime_build.lockdir;'
+    'while ! mkdir "$_sky_lk" 2>/dev/null; do '
+    'find "$_sky_lk" -maxdepth 0 -mmin +30 2>/dev/null | grep -q . && '
+    'rmdir "$_sky_lk" 2>/dev/null; sleep 2; done;'
+    "trap 'rmdir \"$_sky_lk\" 2>/dev/null || true' EXIT;"
+    # Keep uv's managed Python INSIDE the runtime dir. By default uv installs it
+    # under $HOME/.local/share/uv/python, but on Slurm $HOME is the per-cluster
+    # home that gets rm'd on `sky down` -- which would dangle the shared venv's
+    # bin/python symlink and break reuse. Co-locating it with the runtime dir
+    # means the interpreter persists (or is cleaned) together with the venv.
+    f'export UV_PYTHON_INSTALL_DIR={SKY_RUNTIME_DIR}/uv-python;'
     # Install uv for venv management and pip installation.
     f'{SKY_UV_INSTALL_CMD};'
     # Create a separate python environment for SkyPilot dependencies.

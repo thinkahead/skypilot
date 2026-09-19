@@ -1366,6 +1366,35 @@ class SSHCommandRunner(CommandRunner):
                                           shell=True,
                                           executable=executable,
                                           **kwargs)
+            # [255-probe] The ssh subprocess returncode surfaces here verbatim
+            # (log_lib.run_with_log returns proc.returncode). ssh collapses both
+            # "remote command exited 255" and "connection/proxy dropped at
+            # teardown" into 255. To tell them apart on the fresh-GPU docker-proxy
+            # flakiness, log the returncode together with whether stdout was
+            # actually produced (remote ran) and whether stderr is empty — a
+            # spurious teardown looks like rc=255 + non-empty stdout + empty
+            # stderr, over a docker ProxyCommand. Only fires on 255, so it is
+            # quiet in the normal case. Remove once the 255 root-cause is closed.
+            if isinstance(result, tuple):
+                _probe_rc = result[0]
+                _probe_out = result[1] if len(result) > 1 else ''
+                _probe_err = result[2] if len(result) > 2 else ''
+            else:
+                _probe_rc = result
+                _probe_out = _probe_err = '<not captured (require_outputs=False)>'
+            if _probe_rc == 255:
+                _over_proxy = self._docker_ssh_proxy_command is not None
+                _out_len = (len(_probe_out)
+                            if isinstance(_probe_out, str) else -1)
+                _out_tail = (_probe_out[-200:]
+                             if isinstance(_probe_out, str) else _probe_out)
+                logger.warning(
+                    f'[255-probe] ssh rc=255 for {self.ssh_user}@{self.ip} '
+                    f'(over_docker_proxy={_over_proxy}) '
+                    f'stdout_len={_out_len} stderr={_probe_err!r} '
+                    f'stdout_tail={_out_tail!r} '
+                    '=> non-empty stdout + empty stderr indicates the remote '
+                    'command SUCCEEDED and the 255 is a spurious ssh teardown.')
             if not self.enable_interactive_auth:
                 return result
 
