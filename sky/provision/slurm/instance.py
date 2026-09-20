@@ -256,24 +256,47 @@ def _sbatch_provision_script_path(base_dir: str,
                         f'{cluster_name_on_cloud}.sh')
 
 
+def _shared_runtime_enabled(region: Optional[str]) -> bool:
+    """Whether the cluster opts into a SHARED (reused) skypilot-runtime dir.
+
+    Controlled by ``slurm.cluster_configs.<cluster>.shared_runtime`` (default
+    False). See ``_skypilot_runtime_dir`` for the two modes.
+    """
+    return bool(
+        skypilot_config.get_effective_region_config(cloud='slurm',
+                                                    region=region,
+                                                    keys=('shared_runtime',),
+                                                    default_value=False))
+
+
 def _skypilot_runtime_dir(tmpdir: Optional[str],
-                          cluster_name_on_cloud: str) -> str:
+                          cluster_name_on_cloud: str,
+                          shared_runtime: bool = False) -> str:
     """Returns the SkyPilot runtime directory path on the Slurm cluster.
 
-    SHARED-RUNTIME MODE: we intentionally return ``tmpdir`` itself (NOT a
-    per-cluster subdir), so the expensive skypilot-runtime venv (uv + sky + ray)
-    is built ONCE under ``tmpdir/skypilot-runtime`` and REUSED across launches --
-    setup_runtime is idempotent and wheel-hash-guarded, so on later launches it
-    becomes a fast no-op. The cleanup trap is patched to NOT delete this dir.
-    Point ``tmpdir`` at a shared, container-visible FS (e.g. /proj/.../sky-runtime).
+    Two modes, selected by ``slurm.cluster_configs.<cluster>.shared_runtime``
+    (default False; plumbed in via ``shared_runtime``).
 
-    NOTE: the runtime dir also holds per-cluster skylet state (skylet_pid,
-    jobs.db), so this is safe for ONE cluster at a time (sequential launches);
-    concurrent clusters sharing the same ``tmpdir`` would collide.
-    ``cluster_name_on_cloud`` is unused in this mode.
+    PER-CLUSTER MODE (default): returns ``<tmpdir>/<cluster_name_on_cloud>`` --
+    each cluster gets its OWN runtime dir (runtime venv + per-cluster skylet
+    state: skylet_pid, jobs.db). This is CONCURRENT-SAFE: multiple clusters can
+    be launched at once (e.g. parallel evals) without colliding on shared skylet
+    state. The cleanup trap removes this per-cluster dir on teardown. Cost: each
+    fresh cluster rebuilds its runtime venv (setup_runtime is idempotent +
+    wheel-hash-guarded, but a fresh per-cluster dir has nothing to reuse).
+
+    SHARED-RUNTIME MODE (``shared_runtime=True``): returns ``tmpdir`` itself, so
+    the expensive skypilot-runtime venv (uv + sky + ray) is built ONCE under
+    ``tmpdir`` and REUSED across sequential launches -- fast relaunch for an
+    iterative single-cluster workflow (e.g. KD). The cleanup trap is patched to
+    NOT delete this dir. UNSAFE for concurrent clusters (they would collide on
+    the shared skylet_pid/jobs.db). Point ``tmpdir`` at a shared,
+    container-visible FS (e.g. /proj/.../sky-runtime).
     """
-    del cluster_name_on_cloud  # unused in shared-runtime mode
-    return tmpdir if tmpdir is not None else '/tmp'
+    base = tmpdir if tmpdir is not None else '/tmp'
+    if shared_runtime:
+        return base
+    return os.path.join(base, cluster_name_on_cloud)
 
 
 def _enroot_container_name_global_scope(cluster_name_on_cloud: str) -> str:
@@ -504,7 +527,13 @@ def _create_virtual_instance(
         sky_base_dir, cluster_name_on_cloud)
     provision_scripts_dir = os.path.dirname(provision_script_path)
 
-    skypilot_runtime_dir = _skypilot_runtime_dir(tmpdir, cluster_name_on_cloud)
+    shared_runtime = _shared_runtime_enabled(region)
+    skypilot_runtime_dir = _skypilot_runtime_dir(tmpdir, cluster_name_on_cloud,
+                                                 shared_runtime)
+    # PER-CLUSTER mode: delete the runtime dir on teardown (it is this cluster's
+    # own dir). SHARED mode: keep it (reused across launches; sweep manually).
+    runtime_dir_cleanup = ('' if shared_runtime else
+                           f'    rm -rf {skypilot_runtime_dir}\n')
     sky_cluster_home_dir = _sky_cluster_home_dir(sky_base_dir,
                                                  cluster_name_on_cloud)
     ready_signal = f'{sky_cluster_home_dir}/.sky_sbatch_ready'
@@ -583,14 +612,29 @@ def _create_virtual_instance(
         # For containers, ~ is /root which is isolated inside the container,
         # so modifying bashrc doesn't affect non-containerized sessions.
         container_init_script = """\
-set -e
 echo "[container-init] Starting..."
 INIT_START=$SECONDS
-apt-get update
-apt-get install -y ca-certificates rsync curl git wget fuse
+# Some images (e.g. the sage/bfcl eval images) ship a BROKEN dpkg statoverride that references a
+# removed system group (e.g. 'messagebus'), which makes EVERY apt/dpkg install abort with
+# "unknown system group '<g>' in statoverride file" (dpkg exit 2). Drop any statoverride whose
+# group no longer exists so dpkg can proceed. Harmless when there are none.
+if command -v dpkg-statoverride >/dev/null 2>&1; then
+  dpkg-statoverride --list 2>/dev/null | while read -r _o _g _m _p; do
+    getent group "$_g" >/dev/null 2>&1 || dpkg-statoverride --remove "$_p" 2>/dev/null || true
+  done
+fi
+# Install the tools SkyPilot's runtime NEEDS (rsync for file sync, curl for the uv installer;
+# git/wget/fuse incidental). Skip when rsync+curl already present. NON-FATAL, but note: if the
+# image lacks rsync AND apt can't install it, SkyPilot's runtime_files rsync WILL fail later.
+if command -v rsync >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+  echo "[container-init] rsync+curl already present; skipping apt-get"
+else
+  { apt-get update && apt-get install -y --no-install-recommends ca-certificates rsync curl git wget fuse; } \
+    || echo "[container-init] WARN: apt-get failed (SkyPilot runtime rsync sync may then fail)"
+fi
 mkdir -p "$HOME" 2>/dev/null || true
 echo 'alias sudo=""' >> "$HOME/.bashrc" 2>/dev/null || true
-echo "[container-init] Packages installed in $((SECONDS - INIT_START))s"
+echo "[container-init] done in $((SECONDS - INIT_START))s"
 """
         container_marker_file = (f'{sky_cluster_home_dir}/'
                                  f'{slurm_utils.SLURM_CONTAINER_MARKER_FILE}')
@@ -698,12 +742,11 @@ cleanup() {{
     # When container_scope=job, named containers are removed automatically
     # at the end of the Slurm job, see: https://github.com/NVIDIA/pyxis/wiki/Setup#slurm-epilog
     srun --nodes={num_nodes} --ntasks-per-node=1 enroot remove -f {shlex.quote(_enroot_container_name_global_scope(cluster_name_on_cloud))} 2>/dev/null || true
-    # SHARED-RUNTIME MODE: do NOT delete the runtime dir ({skypilot_runtime_dir})
-    # on teardown -- it is the shared, reused skypilot-runtime venv (see
-    # _skypilot_runtime_dir). Deleting it would force a slow rebuild on the next
-    # launch. Only the per-cluster home dir is removed. (Sweep the shared runtime
-    # manually if it ever needs reclaiming.)
-    rm -rf {sky_cluster_home_dir}
+    # PER-CLUSTER mode: the next line removes this cluster's own runtime dir.
+    # SHARED mode: the line is empty -- the reused skypilot-runtime venv is kept
+    # across launches (see _skypilot_runtime_dir); sweep it manually if it ever
+    # needs reclaiming. The per-cluster home dir is always removed.
+{runtime_dir_cleanup}    rm -rf {sky_cluster_home_dir}
     exit $saved_exit
 }}
 # Run cleanup on any exit, including container init failures.
@@ -1040,35 +1083,33 @@ def terminate_instances(
         logger.debug(f'Job for cluster {cluster_name_on_cloud} not found, '
                      'it may have been terminated.')
         return
-    assert len(jobs_state) == 1, (
-        f'Multiple jobs found for cluster {cluster_name_on_cloud}: {jobs_state}'
-    )
 
-    job_state = jobs_state[0].strip()
-    # Terminal states where scancel is not needed or will fail.
+    # NOTE: there can be MORE THAN ONE job with this name. cluster_name_on_cloud is a
+    # deterministic hash, so if a prior allocation was orphaned (a manual scancel, or a
+    # failed-setup launch whose job id was never recorded and therefore could not be
+    # cancelled) a later launch creates a *second* job with the same name. The previous
+    # `assert len(jobs_state) == 1` raised here and left EVERY same-named job orphaned
+    # (leaking whole exclusive nodes). `scancel --name` cancels all of them in one shot,
+    # so cancel whenever ANY job is in a non-terminal state instead of asserting exactly
+    # one. COMPLETING is treated as terminal (already being torn down).
     terminal_states = {
         'COMPLETED', 'CANCELLED', 'FAILED', 'TIMEOUT', 'NODE_FAIL', 'PREEMPTED',
-        'SPECIAL_EXIT'
+        'SPECIAL_EXIT', 'COMPLETING',
     }
-    if job_state in terminal_states:
+    states = [s.strip() for s in jobs_state]
+    if all(s in terminal_states for s in states):
         logger.debug(
-            f'Job for cluster {cluster_name_on_cloud} is already in a terminal '
-            f'state {job_state}. No action needed.')
+            f'All jobs for cluster {cluster_name_on_cloud} are terminal/completing '
+            f'({states}); no action needed.')
         return
 
-    if job_state in ('PENDING', 'CONFIGURING'):
-        # For pending/configuring jobs, cancel without signal to avoid hangs.
-        client.cancel_jobs_by_name(cluster_name_on_cloud, signal=None)
-    elif job_state == 'COMPLETING':
-        # Job is already being terminated. No action needed.
-        logger.debug(
-            f'Job for cluster {cluster_name_on_cloud} is already completing. '
-            'No action needed.')
-    else:
-        # For other states (e.g., RUNNING, SUSPENDED), send a TERM signal.
-        client.cancel_jobs_by_name(cluster_name_on_cloud,
-                                   signal='TERM',
-                                   full=True)
+    # Plain `scancel --name` (no explicit --signal) delivers SIGTERM -- which runs the
+    # batch script's cleanup trap -- and then escalates to SIGKILL after the partition's
+    # KillWait, so the allocation is actually released. The previous RUNNING path sent a
+    # single `--signal TERM` with no escalation, so a batch script that did not exit on
+    # SIGTERM (our `sleep infinity` container keep-alive) was left RUNNING -> a leaked
+    # (orphaned) node allocation. Cancelling by name also covers PENDING/CONFIGURING.
+    client.cancel_jobs_by_name(cluster_name_on_cloud, signal=None)
 
 
 def open_ports(
@@ -1199,8 +1240,9 @@ def get_command_runners(
             login_node_ssh_user,
             login_node_ssh_private_key,
             sky_dir=sky_cluster_home_dir,
-            skypilot_runtime_dir=_skypilot_runtime_dir(tmpdir,
-                                                       cluster_name_on_cloud),
+            skypilot_runtime_dir=_skypilot_runtime_dir(
+                tmpdir, cluster_name_on_cloud,
+                _shared_runtime_enabled(slurm_cluster_name)),
             job_id=instance_info.tags['job_id'],
             slurm_node=instance_info.tags['node'],
             ssh_proxy_jump=login_node_ssh_proxy_jump,

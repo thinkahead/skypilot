@@ -6689,16 +6689,28 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             # Resolve SKY_RUNTIME_DIR (tmpdir/<cluster>) the same way the
             # provisioner does, so container executor runs can export it (pyxis
             # does not inherit it from the host).
+            slurm_region = ((handle.cached_cluster_info.provider_config or
+                             {}).get('cluster') or
+                            handle.launched_resources.region)
             slurm_tmpdir = skypilot_config.get_effective_region_config(
                 cloud='slurm',
-                region=((handle.cached_cluster_info.provider_config or {}).get(
-                    'cluster') or handle.launched_resources.region),
+                region=slurm_region,
                 keys=('tmpdir',),
                 default_value=None)
-            # Shared-runtime mode: the runtime dir is `tmpdir` itself (see
-            # sky/provision/slurm/instance.py:_skypilot_runtime_dir), not a
-            # per-cluster subdir. Keep this in sync with that function.
-            skypilot_runtime_dir = slurm_tmpdir or '/tmp'
+            # Resolve the runtime dir EXACTLY as the provisioner does (see
+            # sky/provision/slurm/instance.py:_skypilot_runtime_dir): SHARED mode
+            # (shared_runtime: true) -> `tmpdir` itself; PER-CLUSTER mode
+            # (default) -> `<tmpdir>/<cluster_name_on_cloud>`. Keep in sync.
+            slurm_shared_runtime = bool(
+                skypilot_config.get_effective_region_config(
+                    cloud='slurm',
+                    region=slurm_region,
+                    keys=('shared_runtime',),
+                    default_value=False))
+            _slurm_rt_base = slurm_tmpdir or '/tmp'
+            skypilot_runtime_dir = (
+                _slurm_rt_base if slurm_shared_runtime else os.path.join(
+                    _slurm_rt_base, handle.cluster_name_on_cloud))
             return task_codegen.SlurmCodeGen(
                 slurm_job_id,
                 container_name,

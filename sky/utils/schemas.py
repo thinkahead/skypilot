@@ -2076,6 +2076,17 @@ def get_config_schema():
                             'tmpdir': {
                                 'type': 'string',
                             },
+                            # false (default) = PER-CLUSTER runtime dir
+                            # (<tmpdir>/<cluster>): concurrent-safe, so multiple
+                            # clusters (e.g. parallel evals) can run at once.
+                            # true = SHARED runtime dir (tmpdir itself): the
+                            # runtime venv is built once and reused across
+                            # sequential launches (fast relaunch for an iterative
+                            # single-cluster workflow like KD), but UNSAFE for
+                            # concurrent clusters (shared skylet_pid/jobs.db).
+                            'shared_runtime': {
+                                'type': 'boolean',
+                            },
                             'pricing': _PRICING_SCHEMA,
                             'sbatch_options': _SBATCH_OPTIONS_SCHEMA,
                             'gpu_partition_map': _GPU_PARTITION_MAP_SCHEMA,
