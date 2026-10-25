@@ -305,6 +305,15 @@ def build_sky_wheel() -> Tuple[pathlib.Path, str]:
         # wheel content hash doesn't change.
         temp_wheel_dir = pathlib.Path(tempfile.gettempdir()) / wheel_hash
         temp_wheel_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy(latest_wheel, temp_wheel_dir)
+        # Copy to a private file then atomically rename into place. A plain
+        # shutil.copy truncates and rewrites the shared wheel in place, and
+        # concurrent launches read it outside this lock (when staging file
+        # mounts), so one could catch it mid-rewrite and ship a 0-byte wheel
+        # ("Failed to read metadata" at install). os.replace swaps the inode:
+        # readers see either the old or the new complete file.
+        dst = temp_wheel_dir / latest_wheel.name
+        tmp_dst = temp_wheel_dir / f'.{latest_wheel.name}.{os.getpid()}.tmp'
+        shutil.copy(latest_wheel, tmp_dst)
+        os.replace(tmp_dst, dst)
 
     return temp_wheel_dir.absolute(), wheel_hash
