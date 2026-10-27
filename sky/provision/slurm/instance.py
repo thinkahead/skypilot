@@ -38,6 +38,8 @@ def _sbatch_log_path(base_dir: str, job_id: str) -> str:
 POLL_INTERVAL_SECONDS = 2
 # Default KillWait is 30 seconds, so we add some buffer time here.
 _JOB_TERMINATION_TIMEOUT_SECONDS = 60
+# Where the host's rsync is bind-mounted in a container (fallback for rsync-less images).
+_HOST_RSYNC_IN_CONTAINER = '/opt/sky-host-tools/rsync'
 
 # sbatch options that SkyPilot controls and must not be overridden by users.
 # These are either set dynamically based on the resource spec, or are required
@@ -606,6 +608,12 @@ def _create_virtual_instance(
         # runs on the API server, not the node. On a non-IB Slurm cluster this
         # mount source would be absent and should be dropped (or gated via config).
         mount_paths.append('/dev/infiniband:/dev/infiniband')
+        # The host's rsync, read-only, as a fallback for images that ship none and have no
+        # apt to install it (e.g. the RHEL-based quay.io/modh/fms-hf-tuning:v3.2.2, which has
+        # rpm but no package manager). Without rsync, the runtime_files sync fails with
+        # "execve(): rsync: No such file or directory". BlueVela's compute nodes run RHEL 9
+        # rsync 3.2.5, whose libraries (popt/acl/lz4/zstd/libcrypto 3) a RHEL 9 image has.
+        mount_paths.append(f'/usr/bin/rsync:{_HOST_RSYNC_IN_CONTAINER}:ro')
         container_mounts = ','.join(mount_paths)
         # Add sudo alias to bashrc since we're already root in the container.
         # This allows scripts with 'sudo' commands to work without modification.
@@ -628,14 +636,21 @@ fi
 # image lacks rsync AND apt can't install it, SkyPilot's runtime_files rsync WILL fail later.
 if command -v rsync >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
   echo "[container-init] rsync+curl already present; skipping apt-get"
-else
+elif command -v apt-get >/dev/null 2>&1; then
   { apt-get update && apt-get install -y --no-install-recommends ca-certificates rsync curl git wget fuse; } \
     || echo "[container-init] WARN: apt-get failed (SkyPilot runtime rsync sync may then fail)"
+else
+  echo "[container-init] no apt-get; skipping package install"
 fi
+# Still no rsync (no apt, or apt failed): use the host's, bind-mounted read-only.
+if ! command -v rsync >/dev/null 2>&1 && [ -x __HOST_RSYNC__ ] && __HOST_RSYNC__ --version >/dev/null 2>&1; then
+  ln -sf __HOST_RSYNC__ /usr/local/bin/rsync && echo "[container-init] rsync: using host rsync (__HOST_RSYNC__)"
+fi
+command -v rsync >/dev/null 2>&1 || echo "[container-init] WARN: no rsync in container; SkyPilot runtime file sync will fail"
 mkdir -p "$HOME" 2>/dev/null || true
 echo 'alias sudo=""' >> "$HOME/.bashrc" 2>/dev/null || true
 echo "[container-init] done in $((SECONDS - INIT_START))s"
-"""
+""".replace('__HOST_RSYNC__', _HOST_RSYNC_IN_CONTAINER)
         container_marker_file = (f'{sky_cluster_home_dir}/'
                                  f'{slurm_utils.SLURM_CONTAINER_MARKER_FILE}')
         container_init_done_dir = (
