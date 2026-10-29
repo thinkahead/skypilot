@@ -2,6 +2,7 @@
 import copy
 import dataclasses
 import enum
+import errno
 import json
 import math
 import os
@@ -4244,7 +4245,15 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 use_legacy = True
 
         if use_legacy:
-            if backend_utils.is_command_length_over_limit(job_submit_cmd):
+            # Slurm adds two quoting layers on top of the usual two:
+            # SlurmCommandRunner wraps the command in `srun ... bash -c '...'`,
+            # and run_in_background (below) wraps that in
+            # `nohup /bin/bash --login -c '...'`. Count all four, or a ~57 KB
+            # generated driver passes the check at ~81 KB yet reaches exec()
+            # as one ~135 KB ssh argument and fails with E2BIG ("Argument list
+            # too long"; Linux caps a single argument at 128 KiB).
+            if backend_utils.is_command_length_over_limit(
+                    job_submit_cmd, num_quotes=4 if is_slurm else 2):
                 _dump_code_to_file(codegen)
                 job_submit_cmd = f'{mkdir_code} && {code}'
 
@@ -4254,12 +4263,26 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             # Retry on a spurious docker-proxy SSH 255 (same rationale as
             # _add_job above; queue_job by job_id is safe to re-issue).
             for _attempt in range(_SPURIOUS_SSH_255_RETRIES + 1):
-                returncode, stdout, stderr = self.run_on_head(
-                    handle,
-                    job_submit_cmd,
-                    stream_logs=False,
-                    require_outputs=True,
-                    run_in_background=is_slurm)
+                try:
+                    returncode, stdout, stderr = self.run_on_head(
+                        handle,
+                        job_submit_cmd,
+                        stream_logs=False,
+                        require_outputs=True,
+                        run_in_background=is_slurm)
+                except OSError as e:
+                    # E2BIG is raised locally by exec() before anything
+                    # reaches the remote, so the output-based "too long"
+                    # check below never sees it. Fall back to uploading the
+                    # driver as a file, as for an over-limit command.
+                    if e.errno != errno.E2BIG:
+                        raise
+                    logger.debug('Job submit command too long for exec() '
+                                 f'({len(job_submit_cmd)} bytes before '
+                                 'quoting); dumping the job to a file.')
+                    _dump_code_to_file(codegen)
+                    job_submit_cmd = f'{mkdir_code} && {code}'
+                    continue
                 if (returncode != 255 or
                         _attempt == _SPURIOUS_SSH_255_RETRIES):
                     break

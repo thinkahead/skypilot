@@ -292,16 +292,22 @@ def _caller_is_viewer() -> bool:
             rbac_mod.RoleName.ADMIN.value not in roles)
 
 
-def is_command_length_over_limit(command: str) -> bool:
+def is_command_length_over_limit(command: str, num_quotes: int = 2) -> bool:
     """Check if the length of the command exceeds the limit.
 
-    We calculate the length of the command after quoting the command twice as
-    when it is executed by the CommandRunner, the command will be quoted twice
-    to ensure the correctness, which will add significant length to the command.
+    We calculate the length of the command after quoting it ``num_quotes``
+    times, the number of shell-quoting layers it goes through before reaching
+    exec(). By default it is quoted twice by the CommandRunner. Each layer
+    rewrites every ``'`` as ``'"'"'``, so a quote-heavy script (e.g. generated
+    Python) grows quickly; on Slurm the job-submit command gets two more layers
+    (``srun ... bash -c`` and, in the background, ``nohup bash --login -c``),
+    so callers on that path pass a larger ``num_quotes``.
     """
 
-    quoted_length = len(shlex.quote(shlex.quote(command)))
-    return quoted_length > _MAX_INLINE_SCRIPT_LENGTH
+    quoted = command
+    for _ in range(num_quotes):
+        quoted = shlex.quote(quoted)
+    return len(quoted) > _MAX_INLINE_SCRIPT_LENGTH
 
 
 def is_ip(s: str) -> bool:

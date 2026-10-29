@@ -647,3 +647,22 @@ def test_make_safe_symlink_command_leaves_target_unquoted():
         source='/etc/config', target='~/.sky/file_mounts/etc/config')
     assert 'ln -s ~/.sky/file_mounts/etc/config /etc/config' in cmd
     assert "'~/.sky/file_mounts/etc/config'" not in cmd
+
+
+def test_is_command_length_over_limit_counts_quote_layers():
+    """Each shell-quoting layer rewrites ' as '"'"', so a quote-heavy command
+    that fits after 2 layers can exceed the limit after the 4 it gets on Slurm
+    (job submit: + srun bash -c + nohup bash --login -c)."""
+    limit = backend_utils._MAX_INLINE_SCRIPT_LENGTH
+    # ~57 KB with one quote per 80 characters, roughly the density of the
+    # generated Slurm job driver: ~70 KB after 2 layers, ~175 KB after 4.
+    quote_heavy = ('a' * 79 + "'") * (57 * 1024 // 80)
+    assert not backend_utils.is_command_length_over_limit(quote_heavy)
+    assert not backend_utils.is_command_length_over_limit(quote_heavy,
+                                                          num_quotes=2)
+    assert backend_utils.is_command_length_over_limit(quote_heavy,
+                                                      num_quotes=4)
+    # Quote-free commands are unaffected by the extra layers.
+    plain = 'a' * (limit - 100)
+    assert not backend_utils.is_command_length_over_limit(plain, num_quotes=4)
+    assert backend_utils.is_command_length_over_limit('a' * (limit + 1))
