@@ -651,6 +651,24 @@ mkdir -p "$HOME" 2>/dev/null || true
 echo 'alias sudo=""' >> "$HOME/.bashrc" 2>/dev/null || true
 echo "[container-init] done in $((SECONDS - INIT_START))s"
 """.replace('__HOST_RSYNC__', _HOST_RSYNC_IN_CONTAINER)
+        # GPUs for the container-create step. With ConstrainDevices=yes each srun step gets a
+        # device cgroup holding only ITS GPUs, and enroot's NVIDIA hook (NVIDIA_VISIBLE_DEVICES=all)
+        # bind-mounts the /dev/nvidia* it can see at :create time. The create step used to request
+        # no GPUs, so it saw whichever device(s) the job's batch step exposed, and the later run
+        # step's GPUs (a different set, chosen by SLURM per step) were only partly present: e.g.
+        # run step GPUs 0,6 but only /dev/nvidia0 in the container -> vLLM TP=2 saw 1 GPU and
+        # refused to start (~11% of 2-GPU eval jobs on BlueVela). Giving the create step ALL of
+        # the job's GPUs on each node (--overlap, so the run step can still use them) puts every
+        # one of the job's /dev/nvidia* in the container; the run step's own cgroup still limits
+        # which the task can use, and CUDA_VISIBLE_DEVICES indexes within them.
+        container_gres_flag = ''
+        if accelerator_count > 0:
+            if (accelerator_type is not None and
+                    accelerator_type.upper() != 'NONE'):
+                container_gres_flag = (
+                    f'--gres=gpu:{accelerator_type}:{accelerator_count} ')
+            else:
+                container_gres_flag = f'--gres=gpu:{accelerator_count} '
         container_marker_file = (f'{sky_cluster_home_dir}/'
                                  f'{slurm_utils.SLURM_CONTAINER_MARKER_FILE}')
         container_init_done_dir = (
@@ -690,6 +708,7 @@ echo "[container-init] done in $((SECONDS - INIT_START))s"
             f'2>/dev/null || true\n'
             f'srun --overlap {"--label " if num_nodes > 1 else ""}--unbuffered '
             f'--nodes={num_nodes} --ntasks-per-node=1 '
+            f'{container_gres_flag}'
             f'--container-image={shlex.quote(container_image)} '
             f'--container-name={shlex.quote(container_name)}:create '
             f'--container-mounts="{container_mounts}" '
