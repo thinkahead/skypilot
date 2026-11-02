@@ -622,6 +622,8 @@ def _create_virtual_instance(
         container_init_script = """\
 echo "[container-init] Starting..."
 INIT_START=$SECONDS
+echo "[container-init] gpu-diag host=$(hostname -s) SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-} SLURM_STEP_GPUS=${SLURM_STEP_GPUS:-} NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+echo "[container-init] gpu-diag /dev: $(echo /dev/nvidia[0-9]*)"
 # Some images (e.g. the sage/bfcl eval images) ship a BROKEN dpkg statoverride that references a
 # removed system group (e.g. 'messagebus'), which makes EVERY apt/dpkg install abort with
 # "unknown system group '<g>' in statoverride file" (dpkg exit 2). Drop any statoverride whose
@@ -669,6 +671,14 @@ echo "[container-init] done in $((SECONDS - INIT_START))s"
                     f'--gres=gpu:{accelerator_type}:{accelerator_count} ')
             else:
                 container_gres_flag = f'--gres=gpu:{accelerator_count} '
+        # Belt and braces for the above: the create step has still been seen (jobs 646993,
+        # 647158) to get only the FIRST of the run step's GPUs in /dev, so bind-mount every
+        # host /dev/nvidia<N> into the container as well. Safe: ConstrainDevices still limits
+        # each step to its own GPUs (nvidia-smi in a 2-GPU step lists 2 of the 8), exactly as
+        # for a non-container step, which also sees all 8 device nodes. Evaluated on the node.
+        gpu_dev_mounts = ''
+        if accelerator_count > 0:
+            gpu_dev_mounts = '${GPU_DEV_MOUNTS:+,$GPU_DEV_MOUNTS}'
         container_marker_file = (f'{sky_cluster_home_dir}/'
                                  f'{slurm_utils.SLURM_CONTAINER_MARKER_FILE}')
         container_init_done_dir = (
@@ -683,6 +693,8 @@ echo "[container-init] done in $((SECONDS - INIT_START))s"
             f'srun --nodes={num_nodes} mkdir -p {host_ccache_dir}\n'
             f'CONTAINER_START=$SECONDS\n'
             f'echo "[container] Initializing {container_name} on all nodes"\n'
+            'GPU_DEV_MOUNTS=$(ls /dev/nvidia[0-9]* 2>/dev/null | '
+            "sed 's|.*|&:&|' | paste -sd, -)\n"
             f'rm -rf {container_init_done_dir}\n'
             f'mkdir -p {container_init_done_dir}\n'
             # Ensure enroot's NVIDIA hook injects the GPU driver (libcuda.so.1)
@@ -711,7 +723,7 @@ echo "[container-init] done in $((SECONDS - INIT_START))s"
             f'{container_gres_flag}'
             f'--container-image={shlex.quote(container_image)} '
             f'--container-name={shlex.quote(container_name)}:create '
-            f'--container-mounts="{container_mounts}" '
+            f'--container-mounts="{container_mounts}{gpu_dev_mounts}" '
             '--container-env=NVIDIA_VISIBLE_DEVICES,NVIDIA_DRIVER_CAPABILITIES '
             f'--container-remap-root '
             f'--no-container-mount-home '
